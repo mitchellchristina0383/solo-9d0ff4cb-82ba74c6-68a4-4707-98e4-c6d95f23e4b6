@@ -29,9 +29,9 @@ from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from dnslab import dnsproto
+from dnslab import dnsproto, monitor as monitor_mod
 
 ZONE = "lab.test"
 DB_PATH = os.environ.get("SLAVE_DB", "/data/slave.db")
@@ -42,6 +42,9 @@ SYNC_INTERVAL = float(os.environ.get("SYNC_INTERVAL", "0"))  # seconds; 0 = manu
 FETCH_TIMEOUT = float(os.environ.get("FETCH_TIMEOUT", "10"))
 
 SOA_TIMERS = {"refresh": 7200, "retry": 3600, "expire": 1209600, "minimum": 300}
+
+# Reflection-amplification monitoring (claimed source -> /24 aggregation).
+monitor_service = monitor_mod.MonitorService(DB_PATH)
 
 
 class ZoneData:
@@ -264,6 +267,11 @@ def handle_query(data: bytes) -> Optional[bytes]:
     return dnsproto.answer(query, zone, ZONE)
 
 
+def _question_label(query: dnsproto.Query) -> str:
+    """Stable identity of the question for retransmission dedup."""
+    return f"{query.qname.lower()};qtype={query.qtype};qclass={query.qclass}"
+
+
 class DnsProtocol(asyncio.DatagramProtocol):
     def connection_made(self, transport):
         self.transport = transport
@@ -272,9 +280,43 @@ class DnsProtocol(asyncio.DatagramProtocol):
         response = handle_query(data)
         if response is not None:
             self.transport.sendto(response, addr)
+        # Monitoring must never interfere with answering: the store call is
+        # fire-and-forget on the monitor thread and any residual failure is
+        # swallowed here, reflected only via /monitor/health.
+        try:
+            query = dnsproto.Query(data)
+        except dnsproto.DnsError:
+            return
+        if response is None:
+            return
+        local_ip, local_port = self.transport.get_extra_info(
+            "sockname", ("", DNS_PORT)
+        )[:2]
+        src_ip, src_port = addr[0], addr[1]
+        monitor_service.record_transaction(
+            src_ip=src_ip,
+            src_port=src_port,
+            dst_ip=str(local_ip),
+            dst_port=int(local_port),
+            proto=17,  # UDP
+            xid=query.xid,
+            question=_question_label(query),
+            req_bytes=len(data),
+            resp_bytes=len(response),
+        )
 
     def error_received(self, exc):
         pass
+
+
+async def _monitor_sweep_loop() -> None:
+    """Once per second: expire old transactions and reconcile open events."""
+    while True:
+        await asyncio.sleep(monitor_mod.SWEEP_INTERVAL)
+        try:
+            monitor_service.sweep()
+        except Exception:
+            pass  # availability is recorded inside the store
 
 
 # --------------------------------------------------------------------------
@@ -287,24 +329,32 @@ async def lifespan(app: FastAPI):
     persisted = load_persisted()
     if persisted is not None:
         state.zone = persisted
+    # Monitoring starts before the UDP socket so the first query is covered;
+    # its state (window + events) is resumed from the same SQLite file.
+    monitor_service.start()
     loop = asyncio.get_running_loop()
     transport, _ = await loop.create_datagram_endpoint(
         DnsProtocol, local_addr=(DNS_HOST, DNS_PORT)
     )
     poller = asyncio.create_task(_poll_loop()) if SYNC_INTERVAL > 0 else None
+    sweeper = asyncio.create_task(_monitor_sweep_loop())
     try:
         yield
     finally:
         transport.close()
+        sweeper.cancel()
         if poller is not None:
             poller.cancel()
+        monitor_service.stop()
 
 
 app = FastAPI(
     title="lab.test DNS slave",
     description="Pulls snapshots from the master and answers A/SOA/NXDOMAIN "
-    "over UDP. Only complete, newer versions are applied.",
-    version="1.0.0",
+    "over UDP. Only complete, newer versions are applied. Also records "
+    "reflection-amplification risk events per claimed source /24 under "
+    "/monitor (thresholds and events viewable here in /docs).",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -352,3 +402,90 @@ def zone_dump() -> dict:
 async def sync(req: Optional[SyncRequest] = None) -> dict:
     """Pull a snapshot from the master and apply it if complete and newer."""
     return await do_sync(req or SyncRequest())
+
+
+# --------------------------------------------------------------------------
+# reflection-amplification monitoring API
+# --------------------------------------------------------------------------
+
+class MonitorConfigBody(BaseModel):
+    min_factor: Optional[float] = Field(
+        None, gt=0, description="answer/query byte ratio that qualifies a transaction"
+    )
+    min_events: Optional[int] = Field(
+        None, ge=1, description="qualifying transactions in the window that open an event"
+    )
+
+
+def _unavailable(exc: Exception) -> HTTPException:
+    return HTTPException(503, f"monitoring unavailable: {exc}")
+
+
+@app.get("/monitor/config")
+def monitor_config() -> dict:
+    """Current amplification threshold, event threshold and window settings."""
+    try:
+        return monitor_service.get_config()
+    except (sqlite3.Error, monitor_mod.MonitorUnavailable) as exc:
+        raise _unavailable(exc)
+
+
+@app.put("/monitor/config")
+def monitor_config_put(body: MonitorConfigBody) -> dict:
+    """Change thresholds.
+
+    Open events are closed and the raw transactions still inside the window
+    are re-judged against the new thresholds, opening fresh events where the
+    new bar is met.
+    """
+    if body.min_factor is None and body.min_events is None:
+        raise HTTPException(400, "provide min_factor and/or min_events")
+    try:
+        return monitor_service.update_config(body.min_factor, body.min_events)
+    except (sqlite3.Error, monitor_mod.MonitorUnavailable) as exc:
+        raise _unavailable(exc)
+
+
+@app.get("/monitor/events")
+def monitor_events(status: str = "open") -> dict:
+    """Risk events: 'open' (default), 'closed' or 'all'."""
+    if status not in ("open", "closed", "all"):
+        raise HTTPException(400, "status must be open, closed or all")
+    try:
+        events = monitor_service.list_events(None if status == "all" else status)
+    except (sqlite3.Error, monitor_mod.MonitorUnavailable) as exc:
+        raise _unavailable(exc)
+    return {"status_filter": status, "events": events}
+
+
+@app.get("/monitor/window")
+def monitor_window() -> dict:
+    """Per-source-/24 breakdown of the current rolling 60 s window."""
+    try:
+        stats = monitor_service.window_stats()
+    except (sqlite3.Error, monitor_mod.MonitorUnavailable) as exc:
+        raise _unavailable(exc)
+    return {"window_seconds": monitor_mod.WINDOW_SECONDS, "subnets": stats}
+
+
+@app.get("/monitor/health")
+def monitor_health() -> dict:
+    """Monitoring store availability; 503 when writes are failing.
+
+    A 503 here never affects DNS answering, which keeps following the normal
+    zone rules.
+    """
+    health = monitor_service.health()
+    if not health["available"]:
+        raise HTTPException(503, health)
+    return health
+
+
+@app.post("/monitor/debug/fault")
+def monitor_debug_fault(enabled: bool = True) -> dict:
+    """Test-only: force monitoring writes to fail (or restore them)."""
+    try:
+        monitor_service.set_fault(enabled)
+    except (sqlite3.Error, monitor_mod.MonitorUnavailable) as exc:
+        raise _unavailable(exc)
+    return {"injected_failure": enabled, "health": monitor_service.health()}

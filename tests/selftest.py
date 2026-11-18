@@ -35,6 +35,8 @@ SLAVE_PORT = int(os.environ.get("SLAVE_PORT", "18081"))
 SLAVE_DNS_PORT = int(os.environ.get("SLAVE_DNS_PORT", "15353"))
 SLAVE2_PORT = int(os.environ.get("SLAVE2_PORT", "18082"))
 SLAVE2_DNS_PORT = int(os.environ.get("SLAVE2_DNS_PORT", "15354"))
+MON_PORT = int(os.environ.get("MON_PORT", "18083"))
+MON_DNS_PORT = int(os.environ.get("MON_DNS_PORT", "15355"))
 
 MASTER = f"http://127.0.0.1:{MASTER_PORT}"
 SLAVE = f"http://127.0.0.1:{SLAVE_PORT}"
@@ -116,6 +118,53 @@ def dns_query(name: str, qtype: int, port: int, timeout: float = 3.0) -> dict:
     authority, off = parse_rrs(ns, off)
     return {"xid": rxid, "rcode": flags & 0xF, "aa": bool(flags & dnsproto.FLAG_AA),
             "answers": answers, "authority": authority}
+
+
+def raw_dns(name: str, qtype: int, port: int, *, xid: int = 0x1234,
+            src_port: int = 0, timeout: float = 3.0) -> tuple[int, int, dict]:
+    """Send one raw UDP query; return (request bytes, response bytes, parsed).
+
+    A fixed source port lets the retransmission-dedup rule be exercised:
+    repeats with the same xid/question share the same 5-tuple.
+    """
+    qname = dnsproto.encode_name(name)
+    query = struct.pack("!HHHHHH", xid, 0x0100, 1, 0, 0, 0) + qname + struct.pack("!HH", qtype, 1)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    if src_port:
+        sock.bind(("127.0.0.1", src_port))
+    try:
+        sock.sendto(query, ("127.0.0.1", port))
+        data, _ = sock.recvfrom(4096)
+    finally:
+        sock.close()
+    rxid, flags, qd, an, ns, _ar = struct.unpack("!HHHHHH", data[:12])
+    off = 12
+    for _ in range(qd):
+        _, off = dnsproto.parse_name(data, off)
+        off += 4
+
+    def skip_rrs(count, off):
+        for _ in range(count):
+            _, off = dnsproto.parse_name(data, off)
+            _rtype, _rclass, _ttl, rdlen = struct.unpack("!HHIH", data[off:off + 10])
+            off += 10 + rdlen
+        return off
+
+    off = skip_rrs(an, off)
+    skip_rrs(ns, off)
+    return len(query), len(data), {"xid": rxid, "rcode": flags & 0xF}
+
+
+def wait_events(url: str, status: str, minimum: int, timeout: float = 6.0) -> list:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        st, body = http("GET", f"{url}?status={status}")
+        events = body.get("events", []) if st == 200 else []
+        if len(events) >= minimum:
+            return events
+        time.sleep(0.2)
+    return events
 
 
 class Node:
@@ -364,6 +413,144 @@ def main() -> int:
         check("sync recovers after master returns", st == 200 and body.get("serial") == new_serial, f"got {st} {body}")
         r = dns_query("back.lab.test", dnsproto.QTYPE_A, SLAVE_DNS_PORT)
         check("new record served after recovery", any(a["value"] == "10.7.7.7" for a in r["answers"]), json.dumps(r))
+
+        # ---- 11. amplification monitor: dedup + event lifecycle -------------
+        print("\n== 11. monitor: retransmission dedup and event lifecycle ==")
+        mon = Node("monitor", "dnslab.slave_app:app", MON_PORT, {
+            "SLAVE_DB": os.path.join(tmp, "monitor.db"),
+            "MASTER_URL": MASTER,
+            "DNS_PORT": str(MON_DNS_PORT),
+            "SYNC_INTERVAL": "0",
+            "MONITOR_WINDOW_SECONDS": "30",
+            "MONITOR_DEDUP_SECONDS": "2",
+            "MONITOR_MIN_FACTOR": "1.5",
+            "MONITOR_MIN_EVENTS": "5",
+        }, tmp)
+        MON = f"http://127.0.0.1:{MON_PORT}"
+        try:
+            mon.start()
+            assert wait_http(f"{MON}/status", mon), "monitor node did not start"
+            st, body = http("POST", f"{MON}/sync", {})
+            check("monitor node synced zone", st == 200 and body.get("applied") is True, f"got {st} {body}")
+            st, cfg = http("GET", f"{MON}/monitor/config")
+            check("monitor config defaults", st == 200 and cfg.get("min_factor") == 1.5
+                  and cfg.get("min_events") == 5 and cfg.get("window_seconds") == 30.0, json.dumps(cfg))
+
+            # retransmissions: same 5-tuple (fixed src port), xid, question x3
+            req_len, resp_len, r = raw_dns("host1.lab.test", dnsproto.QTYPE_A,
+                                           MON_DNS_PORT, xid=0x2222, src_port=33333)
+            check("amplification ratio on this answer meets the 1.5 threshold",
+                  resp_len >= 1.5 * req_len, f"req={req_len} resp={resp_len}")
+            for _ in range(2):
+                raw_dns("host1.lab.test", dnsproto.QTYPE_A, MON_DNS_PORT,
+                        xid=0x2222, src_port=33333)
+            time.sleep(0.4)
+            st, win = http("GET", f"{MON}/monitor/window")
+            sub = next((s for s in win.get("subnets", []) if s["subnet"] == "127.0.0.0/24"), None)
+            check("retransmissions within 2s counted once",
+                  st == 200 and sub is not None and sub["total_transactions"] == 1,
+                  json.dumps(win))
+            check("no event before threshold", wait_events(f"{MON}/monitor/events", "open", 1, timeout=1.0) == [])
+
+            # distinct source ports -> distinct transactions; threshold 5 opens one
+            for sp in range(33334, 33338):  # 4 more -> 5 qualifying total
+                raw_dns("host1.lab.test", dnsproto.QTYPE_A, MON_DNS_PORT,
+                        xid=0x3333, src_port=sp)
+            events = wait_events(f"{MON}/monitor/events", "open", 1)
+            check("event opens at 5 qualifying transactions",
+                  len(events) == 1 and events[0]["subnet"] == "127.0.0.0/24"
+                  and events[0]["count"] == 5 and events[0]["ended_at"] is None,
+                  json.dumps(events))
+            ev_id = events[0]["id"]
+            check("event carries byte counters and start time",
+                  events[0]["req_bytes"] == 5 * req_len
+                  and events[0]["resp_bytes"] == 5 * resp_len and events[0]["started_at"],
+                  json.dumps(events[0]))
+            for sp in range(33340, 33343):  # persistent excess updates, not reopens
+                raw_dns("host1.lab.test", dnsproto.QTYPE_A, MON_DNS_PORT,
+                        xid=0x4444, src_port=sp)
+            events = wait_events(f"{MON}/monitor/events", "open", 1)
+            check("persistent excess updates the same event",
+                  len(events) == 1 and events[0]["id"] == ev_id and events[0]["count"] == 8,
+                  json.dumps(events))
+
+            # ---- 12. threshold change: close + re-judge raw window ----------
+            print("\n== 12. monitor: threshold change re-judges raw transactions ==")
+            st, body = http("PUT", f"{MON}/monitor/config", {"min_events": 10})
+            check("threshold raised via API", st == 200 and body.get("min_events") == 10, json.dumps(body))
+            time.sleep(0.4)
+            check("old event closed when threshold raised",
+                  wait_events(f"{MON}/monitor/events", "open", 1, timeout=1.0) == [])
+            st, closed = http("GET", f"{MON}/monitor/events?status=closed")
+            check("closed event retained with end time",
+                  st == 200 and any(e["id"] == ev_id and e["ended_at"] for e in closed.get("events", [])),
+                  json.dumps(closed))
+            st, body = http("PUT", f"{MON}/monitor/config", {"min_events": 3})
+            check("threshold lowered via API", st == 200 and body.get("min_events") == 3)
+            events = wait_events(f"{MON}/monitor/events", "open", 1)
+            check("raw window re-judged: new event under lower threshold",
+                  len(events) == 1 and events[0]["id"] != ev_id
+                  and events[0]["min_events"] == 3 and events[0]["count"] == 8,
+                  json.dumps(events))
+            st, body = http("PUT", f"{MON}/monitor/config", {"min_factor": 100})
+            time.sleep(0.4)
+            check("raising factor threshold closes event (factor ~%.1f)" % (resp_len / req_len),
+                  wait_events(f"{MON}/monitor/events", "open", 1, timeout=1.0) == [])
+            st, body = http("PUT", f"{MON}/monitor/config", {"min_factor": 1.5, "min_events": 5})
+            check("factor restored", st == 200 and body.get("min_factor") == 1.5)
+            check("event reopens from raw transactions after restore",
+                  len(wait_events(f"{MON}/monitor/events", "open", 1)) == 1)
+            st, body = http("PUT", f"{MON}/monitor/config", {})
+            check("empty config change rejected with 400", st == 400, f"got {st}")
+
+            # ---- 13. monitoring write failure: API 503, DNS unaffected -------
+            print("\n== 13. monitor: write failure -> unavailable, DNS still answers ==")
+            st, body = http("POST", f"{MON}/monitor/debug/fault?enabled=true", None)
+            check("fault injected", st == 200, json.dumps(body))
+            raw_dns("host1.lab.test", dnsproto.QTYPE_A, MON_DNS_PORT,
+                    xid=0x5555, src_port=33350)
+            time.sleep(0.6)
+            st, body = http("GET", f"{MON}/monitor/health")
+            detail = body.get("detail", body)  # FastAPI wraps HTTPException body in 'detail'
+            check("health reports 503 while writes fail", st == 503
+                  and detail.get("available") is False, f"got {st} {body}")
+            for path in ("/monitor/events", "/monitor/window", "/monitor/config"):
+                st2, _ = http("GET", f"{MON}{path}")
+                check(f"{path} -> 503 while unavailable", st2 == 503, f"got {st2}")
+            r = dns_query("host1.lab.test", dnsproto.QTYPE_A, MON_DNS_PORT)
+            check("DNS answers normally while monitoring is down",
+                  r["rcode"] == 0 and len(r["answers"]) == 1, json.dumps(r))
+            st, _ = http("POST", f"{MON}/monitor/debug/fault?enabled=false", None)
+            time.sleep(0.4)
+            st, body = http("GET", f"{MON}/monitor/health")
+            check("monitoring recovers after fault cleared", st == 200 and body.get("available") is True,
+                  f"got {st} {body}")
+
+            # ---- 14. restart: window and events resume -----------------------
+            print("\n== 14. monitor: state survives process restart ==")
+            before = wait_events(f"{MON}/monitor/events", "open", 1)
+            mon.stop()
+            time.sleep(0.5)
+            mon.start()
+            assert wait_http(f"{MON}/status", mon), "monitor node did not restart"
+            st, body = http("GET", f"{MON}/monitor/config")
+            check("thresholds persist across restart",
+                  st == 200 and body.get("min_factor") == 1.5 and body.get("min_events") == 5,
+                  json.dumps(body))
+            after = wait_events(f"{MON}/monitor/events", "open", 1)
+            check("open event resumes across restart with same id",
+                  len(after) == 1 and after[0]["id"] == before[0]["id"]
+                  and after[0]["subnet"] == before[0]["subnet"],
+                  f"before={json.dumps(before)} after={json.dumps(after)}")
+            r = dns_query("host1.lab.test", dnsproto.QTYPE_A, MON_DNS_PORT)
+            check("DNS answers after restart without re-sync", r["rcode"] == 0, json.dumps(r))
+            st, spec = http("GET", f"{MON}/openapi.json")
+            mon_paths = ("/monitor/config", "/monitor/events", "/monitor/window",
+                         "/monitor/health")
+            missing = [p for p in mon_paths if p not in spec.get("paths", {})]
+            check("openapi exposes monitor endpoints", st == 200 and not missing, f"missing: {missing}")
+        finally:
+            mon.stop()
 
     finally:
         slave.stop()
